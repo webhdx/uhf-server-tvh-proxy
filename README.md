@@ -132,3 +132,14 @@ Go 1.26 or newer is required.
 go test ./...
 go run .
 ```
+
+## Disclaimer
+
+This project was vibecoded. It is provided as-is, without any warranty, and the
+author accepts no responsibility or liability for whether or how it works, or
+for any damage, data loss, failed recordings, or other consequences resulting
+from its use.
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
