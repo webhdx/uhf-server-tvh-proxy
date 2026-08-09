@@ -1,5 +1,9 @@
 # UHF Server → TVHeadend DVR proxy
 
+<p align="center">
+  <img src="logo.png" alt="UHF Server to TVHeadend DVR proxy logo" width="240">
+</p>
+
 A minimal UHF Server replacement that accepts recording requests from the UHF
 app and creates DVR timers in TVHeadend. The proxy does not download or record
 streams itself.
