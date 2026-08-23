@@ -33,17 +33,49 @@ Create a dedicated API user in TVHeadend. Its access entry needs at least:
 The channel name exposed to UHF should match the corresponding channel name in
 TVHeadend.
 
+## Quick start with Docker
+
+The published image supports `linux/amd64` and `linux/arm64`.
+
+```sh
+docker run -d \
+  --name uhf-server-tvh-proxy \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  -e TVH_URL=http://192.168.1.20:9981 \
+  -e TVH_USERNAME=uhf \
+  -e TVH_PASSWORD=change-me \
+  -e SERVER_PASSWORD=change-me \
+  ghcr.io/webhdx/uhf-server-tvh-proxy:1.0.0
+```
+
+Replace the TVHeadend address and credentials before starting the container.
+`TVH_URL` must be reachable from inside the container.
+
+Check that the proxy is running:
+
+```sh
+curl http://127.0.0.1:8000/server/stats
+```
+
 ## Running with Docker Compose
 
 ```sh
+git clone https://github.com/webhdx/uhf-server-tvh-proxy.git
+cd uhf-server-tvh-proxy
 cp .env.example .env
 ```
 
-Set the TVHeadend URL and API credentials in `.env`, then run:
+Set the TVHeadend URL, API credentials, and optional server password in `.env`,
+then run:
 
 ```sh
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
+
+Set `IMAGE_TAG=1.0.0` in `.env` to pin a specific release. The default is
+`latest`. Upgrade the container with the same `pull` and `up` commands.
 
 If TVHeadend is outside the same Docker network, `TVH_URL` must point to an
 address reachable from the container, for example
@@ -56,6 +88,14 @@ Add the server manually in the UHF app:
 - server password: the `SERVER_PASSWORD` value, if configured.
 
 Automatic mDNS discovery is not implemented yet.
+
+Useful operational commands:
+
+```sh
+docker compose logs -f
+docker compose restart
+docker compose down
+```
 
 ## Configuration
 
@@ -92,6 +132,11 @@ create a timer.
 The following table covers every endpoint exposed by the UHF Server 2.0.0
 OpenAPI document.
 
+Proxy releases use their own semantic version independently of the emulated
+UHF Server version. For example, proxy `1.0.0` emulates the UHF Server `2.0.0`
+API. `/server/stats` reports the emulated server version expected by the UHF
+client.
+
 | Method and endpoint | Status | Current behavior |
 | --- | --- | --- |
 | `POST /auth/login` | Partial | Preserves the UHF response format and issues a stateless, signed token. It validates the optional `SERVER_PASSWORD`, but does not authenticate the account with Firebase. Credentials are not stored. |
@@ -123,6 +168,15 @@ playback—is implemented.
 - Actual TVHeadend host storage, CPU, and memory statistics.
 - Firebase account verification.
 - Automatic discovery through `_uhf-server._tcp.local.` mDNS.
+
+## Building locally
+
+Build and run the container from the current checkout:
+
+```sh
+docker build -t uhf-server-tvh-proxy:local .
+docker run --rm -p 8000:8000 --env-file .env uhf-server-tvh-proxy:local
+```
 
 ## Running without Docker
 

@@ -1,6 +1,6 @@
 services:
   uhf-server-tvh-proxy:
-    build: .
+    image: "ghcr.io/webhdx/uhf-server-tvh-proxy:${IMAGE_TAG:-latest}"
     container_name: uhf-server-tvh-proxy
     restart: unless-stopped
     ports:

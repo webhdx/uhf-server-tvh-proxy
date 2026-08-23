@@ -9,13 +9,10 @@ FROM alpine:3.23
 
 RUN apk add --no-cache ca-certificates \
     && addgroup -S proxy \
-    && adduser -S -G proxy proxy \
-    && mkdir /data \
-    && chown proxy:proxy /data
+    && adduser -S -G proxy proxy
 
 COPY --from=build /uhf-server-tvh-proxy /usr/local/bin/uhf-server-tvh-proxy
 
 USER proxy
 EXPOSE 8000
-VOLUME ["/data"]
 ENTRYPOINT ["uhf-server-tvh-proxy"]
