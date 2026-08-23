@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,11 +38,7 @@ func testServer(t *testing.T, transport roundTripFunc) (*server, http.Handler, s
 		t.Fatal(err)
 	}
 	tvh.client.Transport = transport
-	store, err := openStore(t.TempDir() + "/state.json")
-	if err != nil {
-		t.Fatal(err)
-	}
-	server := newServer(config{StatePath: t.TempDir() + "/state.json"}, tvh, store)
+	server := newServer(config{}, tvh)
 	handler := server.routes()
 
 	request := httptest.NewRequest(http.MethodPost, "/auth/login", strings.NewReader(`{
@@ -73,6 +70,7 @@ func authenticatedRequest(method, path, body, token string) *http.Request {
 
 func TestCreateAndListRecording(t *testing.T) {
 	const tvhUUID = "0123456789abcdef0123456789abcdef"
+	start := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	var createdConf map[string]any
 	var cancelledUUID string
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -89,7 +87,7 @@ func TestCreateAndListRecording(t *testing.T) {
 			if request.URL.Query().Get("limit") != "100000" {
 				t.Fatalf("unexpected grid query: %s", request.URL.RawQuery)
 			}
-			return testResponse(request, http.StatusOK, `{"entries":[{"uuid":"`+tvhUUID+`","sched_status":"scheduled"}]}`, nil), nil
+			return testResponse(request, http.StatusOK, `{"entries":[{"uuid":"`+tvhUUID+`","title":"Evening News","start":`+strconv.FormatInt(start.Unix(), 10)+`,"stop":`+strconv.FormatInt(start.Add(30*time.Minute).Unix(), 10)+`,"create":`+strconv.FormatInt(start.Add(-time.Minute).Unix(), 10)+`,"sched_status":"scheduled"}]}`, nil), nil
 		case "/api/dvr/entry/cancel":
 			if err := request.ParseForm(); err != nil {
 				t.Fatal(err)
@@ -102,7 +100,6 @@ func TestCreateAndListRecording(t *testing.T) {
 		}
 	})
 	_, handler, token := testServer(t, transport)
-	start := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 	body := `{"name":"Evening News","url":"http://tvheadend:9981/stream/channelid/42?profile=pass","start_time":"` + start.Format(time.RFC3339) + `","duration_seconds":1800,"description":"BBC One"}`
 
 	createResponse := httptest.NewRecorder()
@@ -116,6 +113,9 @@ func TestCreateAndListRecording(t *testing.T) {
 	}
 	if createdConf["channelname"] != "BBC One" {
 		t.Fatalf("channelname = %#v", createdConf["channelname"])
+	}
+	if created["id"] != "01234567-89ab-cdef-0123-456789abcdef" {
+		t.Fatalf("created id = %#v, want TVHeadend UUID", created["id"])
 	}
 	if createdConf["start"] != float64(start.Unix()) || createdConf["stop"] != float64(start.Add(30*time.Minute).Unix()) {
 		t.Fatalf("unexpected timer range: %#v", createdConf)
@@ -148,6 +148,109 @@ func TestCreateAndListRecording(t *testing.T) {
 	}
 }
 
+func TestTVHeadendRecordingGetsCompatibleIDAndURL(t *testing.T) {
+	client, err := newTVHClient("http://tvh:9981/root", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := map[string]any{
+		"uuid": "0123456789abcdef0123456789abcdef", "channel": "abcdef0123456789abcdef0123456789",
+		"title": "Imported", "start": float64(1), "stop": float64(61), "channelname": "Polsat Games HD",
+	}
+	entry["url"] = client.recordingURL(entry)
+	response := recordingResponse(entry, time.Unix(2, 0))
+	if response["id"] != "01234567-89ab-cdef-0123-456789abcdef" {
+		t.Fatalf("unexpected id: %#v", response["id"])
+	}
+	if response["url"] != "http://tvh:9981/root/stream/channel/abcdef0123456789abcdef0123456789" {
+		t.Fatalf("unexpected URL: %#v", response["url"])
+	}
+	if response["recurrence_scheduled"] != false {
+		t.Fatalf("unexpected recurrence_scheduled: %#v", response["recurrence_scheduled"])
+	}
+	if response["description"] != "Polsat Games HD" {
+		t.Fatalf("unexpected channel description: %#v", response["description"])
+	}
+}
+
+func TestRecordingMetadataPreservesExistingValues(t *testing.T) {
+	entry := map[string]any{
+		"channelname": "TVHeadend Channel",
+		"metadata":    map[string]any{"name": "UHF Channel", "categoryName": "Sports"},
+	}
+	metadata := recordingMetadata(entry)
+	if metadata["name"] != "UHF Channel" || metadata["categoryName"] != "Sports" {
+		t.Fatalf("existing metadata was not preserved: %#v", metadata)
+	}
+}
+
+func TestTVHeadendRelativeRecordingURLIsReplaced(t *testing.T) {
+	client, err := newTVHClient("http://tvh:9981/root", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return testResponse(request, http.StatusOK, `{"entries":[{"uuid":"0123456789abcdef0123456789abcdef","url":"dvrfile/0123456789abcdef0123456789abcdef","channel":"abcdef0123456789abcdef0123456789","channelname":"Polsat Games HD","channel_icon":"imagecache/5152"}]}`, nil), nil
+	})
+	entries, err := client.recordings(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := entries["0123456789abcdef0123456789abcdef"]["url"]; got != "http://tvh:9981/root/stream/channel/abcdef0123456789abcdef0123456789" {
+		t.Fatalf("unexpected URL: %#v", got)
+	}
+	entry := entries["0123456789abcdef0123456789abcdef"]
+	metadata, _ := entry["metadata"].(map[string]any)
+	if metadata["name"] != "Polsat Games HD" || metadata["thumbnailURL"] != "http://tvh:9981/root/imagecache/5152" || metadata["categoryName"] != "Others" {
+		t.Fatalf("unexpected metadata: %#v", metadata)
+	}
+	if entry["parent_id"] != entry["url"] {
+		t.Fatalf("parent_id = %#v, want URL %#v", entry["parent_id"], entry["url"])
+	}
+}
+
+func TestHLSRouteMatchesAuthenticationContract(t *testing.T) {
+	const tvhUUID = "abcdef0123456789abcdef0123456789"
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/api/dvr/entry/grid" {
+			t.Fatalf("unexpected TVHeadend request: %s", request.URL.String())
+		}
+		return testResponse(request, http.StatusOK, `{"entries":[{"uuid":"`+tvhUUID+`","title":"Test","start":1,"stop":2}]}`, nil), nil
+	})
+	_, handler, token := testServer(t, transport)
+
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/dvr/recordings/"+formatUUID(tvhUUID)+"/hls/index.m3u8?token="+token, nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("HLS route returned %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestMetadataUpdateReturnsCurrentRecordingWithoutPersistence(t *testing.T) {
+	const tvhUUID = "abcdef0123456789abcdef0123456789"
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path != "/api/dvr/entry/grid" {
+			t.Fatalf("unexpected TVHeadend request: %s", request.URL.String())
+		}
+		return testResponse(request, http.StatusOK, `{"entries":[{"uuid":"`+tvhUUID+`","title":"Test","start":1,"stop":2,"metadata":{"existing":true}}]}`, nil), nil
+	})
+	_, handler, token := testServer(t, transport)
+	request := authenticatedRequest(http.MethodPatch, "/dvr/recordings/"+formatUUID(tvhUUID)+"/metadata", `{"metadata":{"new":"value"}}`, token)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("metadata update returned %d: %s", response.Code, response.Body.String())
+	}
+	var recording map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &recording); err != nil {
+		t.Fatal(err)
+	}
+	metadata, _ := recording["metadata"].(map[string]any)
+	if metadata["existing"] != true || metadata["new"] != nil {
+		t.Fatalf("metadata was unexpectedly changed: %#v", metadata)
+	}
+}
+
 func TestChannelSelectorPrefersFullTVHUUID(t *testing.T) {
 	description := "Wrong fallback"
 	selector, err := channelFromRequest(recordingCreate{
@@ -165,6 +268,9 @@ func TestChannelSelectorPrefersFullTVHUUID(t *testing.T) {
 func TestStreamForwardsRangeAndUsesTVHeadendCredentials(t *testing.T) {
 	const tvhUUID = "abcdef0123456789abcdef0123456789"
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/api/dvr/entry/grid" {
+			return testResponse(request, http.StatusOK, `{"entries":[{"uuid":"`+tvhUUID+`","title":"Test","start":1,"stop":2}]}`, nil), nil
+		}
 		if request.URL.Path != "/dvrfile/"+tvhUUID {
 			t.Fatalf("unexpected stream path: %s", request.URL.Path)
 		}
@@ -178,16 +284,9 @@ func TestStreamForwardsRangeAndUsesTVHeadendCredentials(t *testing.T) {
 		headers := http.Header{"Content-Range": {"bytes 10-19/100"}, "Content-Type": {"video/mp2t"}}
 		return testResponse(request, http.StatusPartialContent, "0123456789", headers), nil
 	})
-	server, handler, token := testServer(t, transport)
-	stored := storedRecording{
-		ID: "8ed620c7-3f0b-4b7f-8f6c-3e4106960cbc", TVHUUID: tvhUUID, CreatedAt: time.Now(),
-		Request: recordingCreate{Name: "Test", URL: "http://tvh/stream", StartTime: time.Now(), DurationSeconds: 60},
-	}
-	if err := server.store.put(stored); err != nil {
-		t.Fatal(err)
-	}
+	_, handler, token := testServer(t, transport)
 
-	request := authenticatedRequest(http.MethodGet, "/dvr/recordings/"+stored.ID+"/stream", "", token)
+	request := authenticatedRequest(http.MethodGet, "/dvr/recordings/"+tvhUUID+"/stream", "", token)
 	request.Header.Set("Range", "bytes=10-19")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
@@ -200,7 +299,8 @@ func TestStreamForwardsRangeAndUsesTVHeadendCredentials(t *testing.T) {
 }
 
 func TestTVHStatusMapping(t *testing.T) {
-	request := recordingCreate{StartTime: time.Now().Add(-time.Hour), DurationSeconds: 7200}
+	start := time.Now().Add(-time.Hour)
+	stop := start.Add(2 * time.Hour)
 	cases := []struct {
 		entry map[string]any
 		want  string
@@ -209,9 +309,10 @@ func TestTVHStatusMapping(t *testing.T) {
 		{map[string]any{"status": "Completed OK"}, "completed"},
 		{map[string]any{"status": "File missing"}, "failed"},
 		{map[string]any{"sched_status": "scheduled"}, "scheduled"},
+		{map[string]any{"status": "Scheduled for recording", "sched_status": "scheduled"}, "scheduled"},
 	}
 	for _, test := range cases {
-		if got := tvhStatus(test.entry, request, time.Now()); got != test.want {
+		if got := tvhStatus(test.entry, start, stop, time.Now()); got != test.want {
 			t.Errorf("tvhStatus(%v) = %q, want %q", test.entry, got, test.want)
 		}
 	}
@@ -242,6 +343,19 @@ func TestInvalidBearerMatchesUHFServer(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized || response.Header().Get("WWW-Authenticate") != "Bearer" {
 		t.Fatalf("unexpected authentication response: %d, WWW-Authenticate=%q", response.Code, response.Header().Get("WWW-Authenticate"))
+	}
+}
+
+func TestTokenSurvivesAcrossServerInstances(t *testing.T) {
+	expiresAt := time.Now().Add(time.Hour)
+	first := newServer(config{ServerPassword: "shared-secret"}, nil)
+	second := newServer(config{ServerPassword: "shared-secret"}, nil)
+	token := first.createToken(expiresAt)
+	if !second.validToken(token) {
+		t.Fatal("token was not valid on another server instance")
+	}
+	if newServer(config{ServerPassword: "other-secret"}, nil).validToken(token) {
+		t.Fatal("token was valid with a different server password")
 	}
 }
 

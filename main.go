@@ -14,20 +14,15 @@ func main() {
 		TVHURL:         env("TVH_URL", "http://tvheadend:9981"),
 		TVHUsername:    os.Getenv("TVH_USERNAME"),
 		TVHPassword:    os.Getenv("TVH_PASSWORD"),
-		StatePath:      env("STATE_PATH", "/data/state.json"),
 		ServerPassword: os.Getenv("SERVER_PASSWORD"),
 	}
 
-	store, err := openStore(cfg.StatePath)
-	if err != nil {
-		log.Fatal(err)
-	}
 	tvh, err := newTVHClient(cfg.TVHURL, cfg.TVHUsername, cfg.TVHPassword)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	server := newServer(cfg, tvh, store)
+	server := newServer(cfg, tvh)
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           server.routes(),

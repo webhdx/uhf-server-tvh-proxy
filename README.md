@@ -13,9 +13,9 @@ streams itself.
 1. UHF signs in through the compatible `POST /auth/login` endpoint.
 2. `POST /dvr/recordings` is translated to
    `POST /api/dvr/entry/create` in TVHeadend.
-3. The proxy stores the mapping between the UHF recording ID and the
-   TVHeadend DVR UUID locally.
-4. Recording listing, cancellation, and deletion use the TVHeadend DVR API.
+3. The TVHeadend DVR UUID is exposed directly as the UHF recording ID.
+4. Recording listing, status, cancellation, and deletion are read from or
+   written to the TVHeadend DVR API without local persistence.
 5. `/dvr/recordings/{id}/stream` proxies `/dvrfile/{uuid}` from TVHeadend,
    including HTTP Range support.
 
@@ -66,7 +66,6 @@ Automatic mDNS discovery is not implemented yet.
 | `TVH_USERNAME` | empty | TVHeadend API username |
 | `TVH_PASSWORD` | empty | TVHeadend API password |
 | `SERVER_PASSWORD` | empty | Optional password entered when adding the server in UHF |
-| `STATE_PATH` | `/data/state.json` | Persistent UHF ↔ TVHeadend mapping file |
 
 The UHF account password submitted during login is not verified with Firebase,
 stored, or logged. It is accepted only to preserve the UHF client contract. If
@@ -88,24 +87,25 @@ request's `description` field.
 If the channel cannot be identified, the proxy returns an error and does not
 create a timer.
 
-## UHF 1.6.0 API compatibility
+## UHF 2.0.0 API compatibility
 
-The following table covers every endpoint exposed by the UHF Server 1.6.0
+The following table covers every endpoint exposed by the UHF Server 2.0.0
 OpenAPI document.
 
 | Method and endpoint | Status | Current behavior |
 | --- | --- | --- |
-| `POST /auth/login` | Partial | Preserves the UHF response format and issues a local token. It validates the optional `SERVER_PASSWORD`, but does not authenticate the account with Firebase. Credentials are not stored. |
-| `GET /dvr/recordings` | Supported | Reads DVR state from TVHeadend and returns recordings created through this proxy. Existing TVHeadend recordings created elsewhere are not imported. |
+| `POST /auth/login` | Partial | Preserves the UHF response format and issues a stateless, signed token. It validates the optional `SERVER_PASSWORD`, but does not authenticate the account with Firebase. Credentials are not stored. |
+| `GET /dvr/recordings` | Supported | Reads and returns all DVR entries directly from TVHeadend, including recordings created elsewhere. |
 | `POST /dvr/recordings` | Partial | Creates a single timer through `dvr/entry/create`. Channel UUID and channel-name mapping are supported. Requests containing `recurrence_days` return HTTP 501. |
 | `GET /dvr/recordings/{recording_id}` | Supported | Returns a recording with its current status derived from TVHeadend. |
 | `DELETE /dvr/recordings/{recording_id}` | Supported | Cancels an upcoming or active recording, or removes a finished recording and its file through TVHeadend. |
-| `GET /dvr/recordings/{recording_id}/metadata` | Local support | Returns metadata stored in the proxy state file. |
-| `PATCH /dvr/recordings/{recording_id}/metadata` | Local support | Merges metadata locally; a `null` value removes a key. Changes are not written to TVHeadend DVR metadata. |
+| `GET /dvr/recordings/{recording_id}/metadata` | Partial | Returns a TVHeadend `metadata` object when present, otherwise an empty object. |
+| `PATCH /dvr/recordings/{recording_id}/metadata` | No-op | Validates the request and returns the current recording with HTTP 200, but only logs the update because arbitrary UHF metadata cannot be persisted in TVHeadend. |
 | `GET /dvr/recordings/{recording_id}/stream` | Supported | Proxies TVHeadend `/dvrfile/{uuid}` and forwards `Range`, `If-Range`, `If-None-Match`, and `If-Modified-Since`. |
+| `GET /dvr/recordings/{recording_id}/hls/{name}` | Not available | Preserves the UHF 2.0 route and authentication contract, but returns HTTP 404 because TVHeadend does not expose DVR recordings as UHF-style HLS assets. Use `/stream` instead. |
 | `GET /dvr/recordings/{recording_id}/thumbnail` | Not implemented | The route validates authentication but always returns HTTP 404. |
 | `GET /dvr/recordings/{recording_id}/commercials` | Stub | Always returns an empty commercial list and `total_segments: 0`. |
-| `PATCH /dvr/recordings/{recording_id}/cancel` | Supported | Calls TVHeadend `dvr/entry/cancel` and stores the local `cancelled` status. |
+| `PATCH /dvr/recordings/{recording_id}/cancel` | Supported | Calls TVHeadend `dvr/entry/cancel`; subsequent status is read from TVHeadend. |
 | `PATCH /dvr/recordings/{recording_id}/cancel-recurrence` | Not implemented | Returns HTTP 400 because recurring recordings cannot currently be created. |
 | `GET /server/stats` | Partial | Checks TVHeadend availability through `api/serverinfo` and returns the expected UHF schema. CPU, memory, and disk values describe the proxy or are placeholders rather than TVHeadend host statistics. |
 
@@ -119,7 +119,7 @@ playback—is implemented.
   recurrence settings to TVHeadend `timerec` or `autorec` rules.
 - Thumbnail generation or forwarding.
 - Commercial detection data.
-- Importing TVHeadend recordings that were not created through this proxy.
+- Updating arbitrary UHF metadata, because TVHeadend has no equivalent field.
 - Actual TVHeadend host storage, CPU, and memory statistics.
 - Firebase account verification.
 - Automatic discovery through `_uhf-server._tcp.local.` mDNS.

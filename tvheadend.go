@@ -182,10 +182,51 @@ func (c *tvhClient) recordings(ctx context.Context) (map[string]map[string]any, 
 	entries := make(map[string]map[string]any, len(result.Entries))
 	for _, entry := range result.Entries {
 		if uuid, ok := entry["uuid"].(string); ok {
-			entries[strings.ReplaceAll(uuid, "-", "")] = entry
+			if !isAbsoluteHTTPURL(stringField(entry, "url")) {
+				entry["url"] = c.recordingURL(entry)
+			}
+			c.addUHFMetadata(entry)
+			entries[compactUUID(uuid)] = entry
 		}
 	}
 	return entries, nil
+}
+
+func (c *tvhClient) addUHFMetadata(entry map[string]any) {
+	if _, exists := entry["metadata"].(map[string]any); exists {
+		return
+	}
+	channelName := stringField(entry, "channelname")
+	channelUUID := compactUUID(stringField(entry, "channel"))
+	if channelName == "" || !isTVHUUID(channelUUID) {
+		return
+	}
+	metadata := map[string]any{
+		"name":                 channelName,
+		"categoryName":         "Others",
+		"originalCategoryName": "Others",
+		"playlistID":           strings.ToUpper(formatUUID(channelUUID)),
+	}
+	if icon := strings.TrimLeft(stringField(entry, "channel_icon"), "/"); icon != "" {
+		metadata["thumbnailURL"] = c.endpoint("/" + icon)
+	}
+	entry["metadata"] = metadata
+	entry["parent_id"] = stringField(entry, "url")
+}
+
+func isAbsoluteHTTPURL(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+}
+
+func (c *tvhClient) recordingURL(entry map[string]any) string {
+	if channel := stringField(entry, "channel"); isTVHUUID(channel) {
+		return c.endpoint("/stream/channel/" + compactUUID(channel))
+	}
+	if channelName := stringField(entry, "channelname"); channelName != "" {
+		return c.endpoint("/stream/channelname/" + url.PathEscape(channelName))
+	}
+	return c.endpoint("/dvrfile/" + compactUUID(stringField(entry, "uuid")))
 }
 
 func (c *tvhClient) cancel(ctx context.Context, uuid string) error {

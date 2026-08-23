@@ -5,15 +5,9 @@ services:
     restart: unless-stopped
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
-    volumes:
-      - uhf-proxy-data:/data
     environment:
       PORT: "${PORT:-8000}"
       TVH_URL: "${TVH_URL:-http://tvheadend:9981}"
       TVH_USERNAME: "${TVH_USERNAME:-}"
       TVH_PASSWORD: "${TVH_PASSWORD:-}"
       SERVER_PASSWORD: "${SERVER_PASSWORD:-}"
-      STATE_PATH: /data/state.json
-
-volumes:
-  uhf-proxy-data:

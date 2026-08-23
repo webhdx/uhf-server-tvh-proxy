@@ -1,43 +1,54 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
 
-const emulatedVersion = "1.6.0"
+const emulatedVersion = "2.0.0"
 
 type config struct {
 	ListenAddr     string
 	TVHURL         string
 	TVHUsername    string
 	TVHPassword    string
-	StatePath      string
 	ServerPassword string
+}
+
+type recordingCreate struct {
+	Name              string         `json:"name"`
+	URL               string         `json:"url"`
+	StartTime         time.Time      `json:"start_time"`
+	DurationSeconds   int64          `json:"duration_seconds"`
+	Description       *string        `json:"description,omitempty"`
+	ParentID          *string        `json:"parent_id,omitempty"`
+	Headers           *string        `json:"headers,omitempty"`
+	Metadata          map[string]any `json:"metadata,omitempty"`
+	RecurrenceDays    []int          `json:"recurrence_days,omitempty"`
+	RecurrenceEndDate *time.Time     `json:"recurrence_end_date,omitempty"`
 }
 
 type server struct {
 	cfg       config
 	tvh       *tvhClient
-	store     *recordingStore
 	startedAt time.Time
-	tokensMu  sync.Mutex
-	tokens    map[string]time.Time
 }
 
-func newServer(cfg config, tvh *tvhClient, store *recordingStore) *server {
-	return &server{cfg: cfg, tvh: tvh, store: store, startedAt: time.Now(), tokens: make(map[string]time.Time)}
+func newServer(cfg config, tvh *tvhClient) *server {
+	return &server{cfg: cfg, tvh: tvh, startedAt: time.Now()}
 }
 
 func (s *server) routes() http.Handler {
@@ -51,6 +62,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /dvr/recordings/{id}/metadata", s.auth(s.getMetadata))
 	mux.HandleFunc("PATCH /dvr/recordings/{id}/metadata", s.auth(s.updateMetadata))
 	mux.HandleFunc("GET /dvr/recordings/{id}/stream", s.auth(s.streamRecording))
+	mux.HandleFunc("GET /dvr/recordings/{id}/hls/{name}", s.hlsAsset)
 	mux.HandleFunc("GET /dvr/recordings/{id}/thumbnail", s.thumbnail)
 	mux.HandleFunc("GET /dvr/recordings/{id}/commercials", s.auth(s.commercials))
 	mux.HandleFunc("PATCH /dvr/recordings/{id}/cancel", s.auth(s.cancelRecording))
@@ -77,15 +89,8 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "Invalid server password")
 		return
 	}
-	token, err := randomToken()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Could not create token")
-		return
-	}
 	expiresAt := time.Now().Add(24 * time.Hour)
-	s.tokensMu.Lock()
-	s.tokens[token] = expiresAt
-	s.tokensMu.Unlock()
+	token := s.createToken(expiresAt)
 	refreshToken, _ := randomToken()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id_token": token, "refresh_token": refreshToken, "expires_in": 86400, "device_id": credentials.DeviceID,
@@ -110,14 +115,32 @@ func (s *server) auth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *server) validToken(token string) bool {
-	s.tokensMu.Lock()
-	defer s.tokensMu.Unlock()
-	expiresAt, ok := s.tokens[token]
-	if ok && time.Now().After(expiresAt) {
-		delete(s.tokens, token)
+	expiryText, signature, ok := strings.Cut(token, ".")
+	if !ok {
 		return false
 	}
-	return ok
+	expiry, err := strconv.ParseInt(expiryText, 10, 64)
+	if err != nil || time.Now().Unix() >= expiry {
+		return false
+	}
+	expected := s.signToken(expiryText)
+	provided, err := hex.DecodeString(signature)
+	return err == nil && hmac.Equal(provided, expected)
+}
+
+func (s *server) createToken(expiresAt time.Time) string {
+	expiry := strconv.FormatInt(expiresAt.Unix(), 10)
+	return expiry + "." + hex.EncodeToString(s.signToken(expiry))
+}
+
+func (s *server) signToken(expiry string) []byte {
+	secret := s.cfg.ServerPassword
+	if secret == "" {
+		secret = "uhf-server-tvh-proxy"
+	}
+	signature := hmac.New(sha256.New, []byte(secret))
+	_, _ = signature.Write([]byte(expiry))
+	return signature.Sum(nil)
 }
 
 func (s *server) createRecording(w http.ResponseWriter, r *http.Request) {
@@ -150,18 +173,7 @@ func (s *server) createRecording(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	id, err := randomUUID()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "Could not create recording ID")
-		return
-	}
-	stored := storedRecording{ID: id, TVHUUID: tvhUUID, CreatedAt: now, Request: request}
-	if err := s.store.put(stored); err != nil {
-		_ = s.tvh.cancel(r.Context(), tvhUUID)
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	writeJSON(w, http.StatusCreated, recordingResponse(stored, nil, now))
+	writeJSON(w, http.StatusCreated, createdRecordingResponse(tvhUUID, request, now))
 }
 
 func (s *server) listRecordings(w http.ResponseWriter, r *http.Request) {
@@ -171,96 +183,89 @@ func (s *server) listRecordings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	stored := s.store.list()
-	sort.Slice(stored, func(i, j int) bool { return stored[i].Request.StartTime.Before(stored[j].Request.StartTime) })
-	result := make([]map[string]any, 0, len(stored))
-	for _, recording := range stored {
-		result = append(result, recordingResponse(recording, entries[recording.TVHUUID], now))
+	result := make([]map[string]any, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, recordingResponse(entry, now))
 	}
+	sort.Slice(result, func(i, j int) bool {
+		return timeField(result[i], "start_time").Before(timeField(result[j], "start_time"))
+	})
 	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *server) getRecording(w http.ResponseWriter, r *http.Request) {
-	recording, ok := s.store.get(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "Recording not found")
-		return
-	}
-	entries, err := s.tvh.recordings(r.Context())
+	entry, err := s.recording(r)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeRecordingError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, recordingResponse(recording, entries[recording.TVHUUID], time.Now().UTC()))
+	writeJSON(w, http.StatusOK, recordingResponse(entry, time.Now().UTC()))
 }
 
 func (s *server) cancelRecording(w http.ResponseWriter, r *http.Request) {
-	recording, ok := s.store.get(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "Recording not found")
+	entry, err := s.recording(r)
+	if err != nil {
+		writeRecordingError(w, err)
 		return
 	}
-	if recording.StatusOverride != "cancelled" {
-		if err := s.tvh.cancel(r.Context(), recording.TVHUUID); err != nil {
-			writeError(w, http.StatusBadGateway, err.Error())
-			return
-		}
-		recording.StatusOverride = "cancelled"
-		if err := s.store.put(recording); err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
+	uuid := compactUUID(r.PathValue("id"))
+	if err := s.tvh.cancel(r.Context(), uuid); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
 	}
-	writeJSON(w, http.StatusOK, recordingResponse(recording, nil, time.Now().UTC()))
+	entry["sched_status"] = "cancelled"
+	writeJSON(w, http.StatusOK, recordingResponse(entry, time.Now().UTC()))
 }
 
 func (s *server) deleteRecording(w http.ResponseWriter, r *http.Request) {
-	recording, ok := s.store.get(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "Recording not found")
-		return
-	}
-	entries, err := s.tvh.recordings(r.Context())
+	entry, err := s.recording(r)
 	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
+		writeRecordingError(w, err)
 		return
 	}
-	response := recordingResponse(recording, entries[recording.TVHUUID], time.Now().UTC())
+	response := recordingResponse(entry, time.Now().UTC())
 	status, _ := response["status"].(string)
+	uuid := compactUUID(r.PathValue("id"))
 	if status == "completed" || status == "failed" {
-		err = s.tvh.remove(r.Context(), recording.TVHUUID)
+		err = s.tvh.remove(r.Context(), uuid)
 	} else if status != "cancelled" {
-		err = s.tvh.cancel(r.Context(), recording.TVHUUID)
+		err = s.tvh.cancel(r.Context(), uuid)
 	}
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	if err := s.store.delete(recording.ID); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *server) getMetadata(w http.ResponseWriter, r *http.Request) {
-	recording, ok := s.store.get(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "Recording not found")
+	entry, err := s.recording(r)
+	if err != nil {
+		writeRecordingError(w, err)
 		return
 	}
-	if recording.Request.Metadata == nil {
-		recording.Request.Metadata = map[string]any{}
+	var metadata any
+	if value := recordingMetadata(entry); value != nil {
+		metadata = value
 	}
-	writeJSON(w, http.StatusOK, recording.Request.Metadata)
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	writeJSON(w, http.StatusOK, metadata)
+}
+
+func recordingMetadata(entry map[string]any) map[string]any {
+	if existing, ok := entry["metadata"].(map[string]any); ok {
+		metadata := make(map[string]any, len(existing))
+		for key, value := range existing {
+			metadata[key] = value
+		}
+		return metadata
+	}
+	return nil
 }
 
 func (s *server) updateMetadata(w http.ResponseWriter, r *http.Request) {
-	recording, ok := s.store.get(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "Recording not found")
-		return
-	}
 	var update struct {
 		Metadata map[string]any `json:"metadata"`
 	}
@@ -268,30 +273,21 @@ func (s *server) updateMetadata(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "metadata is required")
 		return
 	}
-	if recording.Request.Metadata == nil {
-		recording.Request.Metadata = make(map[string]any)
-	}
-	for key, value := range update.Metadata {
-		if value == nil {
-			delete(recording.Request.Metadata, key)
-		} else {
-			recording.Request.Metadata[key] = value
-		}
-	}
-	if err := s.store.put(recording); err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
+	entry, err := s.recording(r)
+	if err != nil {
+		writeRecordingError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, recordingResponse(recording, nil, time.Now().UTC()))
+	log.Printf("metadata update ignored for recording %s: TVHeadend metadata persistence is unavailable", formatUUID(r.PathValue("id")))
+	writeJSON(w, http.StatusOK, recordingResponse(entry, time.Now().UTC()))
 }
 
 func (s *server) streamRecording(w http.ResponseWriter, r *http.Request) {
-	recording, ok := s.store.get(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "Recording not found")
+	if _, err := s.recording(r); err != nil {
+		writeRecordingError(w, err)
 		return
 	}
-	response, err := s.tvh.stream(r.Context(), recording.TVHUUID, r)
+	response, err := s.tvh.stream(r.Context(), compactUUID(r.PathValue("id")), r)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -320,20 +316,40 @@ func (s *server) thumbnail(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusUnauthorized, "Authentication required (pass token as query param or Authorization header)")
 }
 
+func (s *server) hlsAsset(w http.ResponseWriter, r *http.Request) {
+	if !s.authenticateFromHeaderOrQuery(w, r) {
+		return
+	}
+	if _, err := s.recording(r); err != nil {
+		writeRecordingError(w, err)
+		return
+	}
+	writeError(w, http.StatusNotFound, "HLS asset not available")
+}
+
+func (s *server) authenticateFromHeaderOrQuery(w http.ResponseWriter, r *http.Request) bool {
+	if token := r.URL.Query().Get("token"); token != "" {
+		if s.validToken(token) {
+			return true
+		}
+		writeError(w, http.StatusForbidden, "Invalid or expired token")
+		return false
+	}
+	authorized := false
+	s.auth(func(http.ResponseWriter, *http.Request) { authorized = true })(w, r)
+	return authorized
+}
+
 func (s *server) commercials(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"commercials": []any{}, "total_segments": 0})
 }
 
 func (s *server) cancelRecurrence(w http.ResponseWriter, r *http.Request) {
-	recording, ok := s.store.get(r.PathValue("id"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "Recording not found")
+	if _, err := s.recording(r); err != nil {
+		writeRecordingError(w, err)
 		return
 	}
-	if len(recording.Request.RecurrenceDays) == 0 {
-		writeError(w, http.StatusBadRequest, "Recording does not have a recurrence schedule")
-		return
-	}
+	writeError(w, http.StatusBadRequest, "Recording does not have a recurrence schedule")
 }
 
 func (s *server) stats(w http.ResponseWriter, r *http.Request) {
@@ -400,51 +416,155 @@ type memoryStatsPayload struct {
 	UsagePercent float64 `json:"usage_percent"`
 }
 
-func recordingResponse(recording storedRecording, entry map[string]any, now time.Time) map[string]any {
-	request := recording.Request
-	status := recording.StatusOverride
-	if status == "" {
-		status = tvhStatus(entry, request, now)
+func createdRecordingResponse(uuid string, request recordingCreate, now time.Time) map[string]any {
+	entry := map[string]any{
+		"uuid": uuid, "title": request.Name, "start": request.StartTime.Unix(),
+		"stop":   request.StartTime.Add(time.Duration(request.DurationSeconds) * time.Second).Unix(),
+		"create": now.Unix(), "sched_status": "scheduled", "url": request.URL, "metadata": request.Metadata,
+	}
+	response := recordingResponse(entry, now)
+	response["description"] = request.Description
+	response["parent_id"] = request.ParentID
+	response["headers"] = request.Headers
+	return response
+}
+
+func recordingResponse(entry map[string]any, now time.Time) map[string]any {
+	start := unixTimeField(entry, "start")
+	stop := unixTimeField(entry, "stop")
+	created := unixTimeField(entry, "create")
+	if created.IsZero() {
+		created = start
+	}
+	description := stringField(entry, "channelname")
+	if description == "" {
+		description = localizedStringField(entry, "description")
+	}
+	var descriptionValue any
+	if description != "" {
+		descriptionValue = description
+	}
+	var metadata any
+	if value := recordingMetadata(entry); value != nil {
+		metadata = value
 	}
 	var filePath any
 	if value := stringField(entry, "filename"); value != "" {
 		filePath = value
 	}
 	return map[string]any{
-		"name": request.Name, "url": request.URL, "start_time": request.StartTime,
-		"duration_seconds": request.DurationSeconds, "description": request.Description,
-		"parent_id": request.ParentID, "headers": request.Headers, "metadata": request.Metadata,
-		"recurrence_days": nil, "recurrence_end_date": nil, "id": recording.ID,
-		"status": status, "created_at": recording.CreatedAt, "file_path": filePath,
-		"error": nil, "recovery_events": nil, "recurrence_group_id": nil, "recurrence_scheduled": nil,
+		"name": localizedStringField(entry, "disp_title", "title"), "url": stringField(entry, "url"), "start_time": start,
+		"duration_seconds": int64(stop.Sub(start).Seconds()), "description": descriptionValue,
+		"parent_id": nullableStringField(entry, "parent_id"), "headers": nil, "metadata": metadata,
+		"recurrence_days": nil, "recurrence_end_date": nil, "id": formatUUID(stringField(entry, "uuid")),
+		"status": tvhStatus(entry, start, stop, now), "created_at": created, "file_path": filePath,
+		"error": nil, "recovery_events": nil, "recurrence_group_id": nil, "recurrence_scheduled": false,
 	}
 }
 
-func tvhStatus(entry map[string]any, request recordingCreate, now time.Time) string {
+func nullableStringField(object map[string]any, key string) any {
+	if value := stringField(object, key); value != "" {
+		return value
+	}
+	return nil
+}
+
+func tvhStatus(entry map[string]any, start, stop, now time.Time) string {
 	text := strings.ToLower(strings.Join([]string{stringField(entry, "status"), stringField(entry, "sched_status"), stringField(entry, "state")}, " "))
 	switch {
+	case strings.Contains(text, "cancel"):
+		return "cancelled"
 	case strings.Contains(text, "failed"), strings.Contains(text, "missed"), strings.Contains(text, "invalid"), strings.Contains(text, "missing"):
 		return "failed"
 	case strings.Contains(text, "completed"), strings.Contains(text, "finished"):
 		return "completed"
-	case strings.Contains(text, "recording"):
-		return "recording"
 	case strings.Contains(text, "scheduled"), strings.Contains(text, "pending"):
 		return "scheduled"
+	case strings.Contains(text, "recording"):
+		return "recording"
 	}
-	if entry == nil {
-		if now.Before(request.StartTime.Add(time.Duration(request.DurationSeconds) * time.Second)) {
-			return "scheduled"
-		}
-		return "failed"
-	}
-	if now.Before(request.StartTime) {
+	if now.Before(start) {
 		return "scheduled"
 	}
-	if now.Before(request.StartTime.Add(time.Duration(request.DurationSeconds) * time.Second)) {
+	if now.Before(stop) {
 		return "recording"
 	}
 	return "completed"
+}
+
+func localizedStringField(object map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringField(object, key); value != "" {
+			return value
+		}
+		if values, ok := object[key].(map[string]any); ok {
+			for _, value := range values {
+				if text, ok := value.(string); ok && text != "" {
+					return text
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func unixTimeField(object map[string]any, key string) time.Time {
+	var seconds int64
+	switch value := object[key].(type) {
+	case float64:
+		seconds = int64(value)
+	case int64:
+		seconds = value
+	case json.Number:
+		seconds, _ = value.Int64()
+	}
+	if seconds == 0 {
+		return time.Time{}
+	}
+	return time.Unix(seconds, 0).UTC()
+}
+
+func timeField(object map[string]any, key string) time.Time {
+	value, _ := object[key].(time.Time)
+	return value
+}
+
+var errRecordingNotFound = errors.New("recording not found")
+
+func (s *server) recording(r *http.Request) (map[string]any, error) {
+	uuid := compactUUID(r.PathValue("id"))
+	if !isTVHUUID(uuid) {
+		return nil, errRecordingNotFound
+	}
+	entries, err := s.tvh.recordings(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	entry, ok := entries[uuid]
+	if !ok {
+		return nil, errRecordingNotFound
+	}
+	return entry, nil
+}
+
+func writeRecordingError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errRecordingNotFound) {
+		writeError(w, http.StatusNotFound, "Recording not found")
+		return
+	}
+	writeError(w, http.StatusBadGateway, err.Error())
+}
+
+func compactUUID(value string) string {
+	return strings.ReplaceAll(value, "-", "")
+}
+
+func formatUUID(value string) string {
+	value = compactUUID(value)
+	if !isTVHUUID(value) {
+		return value
+	}
+	return value[:8] + "-" + value[8:12] + "-" + value[12:16] + "-" + value[16:20] + "-" + value[20:]
 }
 
 func stringField(object map[string]any, key string) string {
@@ -467,17 +587,6 @@ func diskStats(path string) diskStatsPayload {
 		percentage = float64(used) / float64(total) * 100
 	}
 	return diskStatsPayload{Path: path, TotalBytes: total, UsedBytes: used, FreeBytes: free, UsagePercent: percentage}
-}
-
-func randomUUID() (string, error) {
-	data := make([]byte, 16)
-	if _, err := rand.Read(data); err != nil {
-		return "", err
-	}
-	data[6] = (data[6] & 0x0f) | 0x40
-	data[8] = (data[8] & 0x3f) | 0x80
-	value := hex.EncodeToString(data)
-	return fmt.Sprintf("%s-%s-%s-%s-%s", value[:8], value[8:12], value[12:16], value[16:20], value[20:]), nil
 }
 
 func randomToken() (string, error) {
