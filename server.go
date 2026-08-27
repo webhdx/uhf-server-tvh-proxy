@@ -119,10 +119,6 @@ func (s *server) validToken(token string) bool {
 	if !ok {
 		return false
 	}
-	expiry, err := strconv.ParseInt(expiryText, 10, 64)
-	if err != nil || time.Now().Unix() >= expiry {
-		return false
-	}
 	expected := s.signToken(expiryText)
 	provided, err := hex.DecodeString(signature)
 	return err == nil && hmac.Equal(provided, expected)
