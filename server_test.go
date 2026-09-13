@@ -332,6 +332,19 @@ func TestEndpointPreservesHTTPRootAndQuery(t *testing.T) {
 	}
 }
 
+func TestTVHDiskStatsRequiresAccessUpdateValues(t *testing.T) {
+	client, err := newTVHClient("http://tvh:9981", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return testResponse(request, http.StatusOK, `{"boxid":"test","messages":[{"notificationClass":"accessUpdate"}]}`, nil), nil
+	})
+	if _, err := client.diskStats(t.Context()); err == nil {
+		t.Fatal("disk stats unexpectedly accepted an accessUpdate without storage values")
+	}
+}
+
 func TestInvalidBearerMatchesUHFServer(t *testing.T) {
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		t.Fatalf("unexpected TVHeadend request: %s", request.URL.String())
@@ -361,10 +374,18 @@ func TestTokenSurvivesAcrossServerInstances(t *testing.T) {
 
 func TestStatsMatchesObservedUHFShape(t *testing.T) {
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Path != "/api/serverinfo" {
+		switch request.URL.Path {
+		case "/api/serverinfo":
+			return testResponse(request, http.StatusOK, `{"name":"Tvheadend"}`, nil), nil
+		case "/comet/poll":
+			if request.URL.Query().Get("immediate") != "1" {
+				t.Fatalf("unexpected comet query: %s", request.URL.RawQuery)
+			}
+			return testResponse(request, http.StatusOK, `{"boxid":"test","messages":[{"notificationClass":"accessUpdate","freediskspace":171933995008,"useddiskspace":319151938208,"totaldiskspace":491106508800}]}`, nil), nil
+		default:
 			t.Fatalf("unexpected TVHeadend request: %s", request.URL.String())
+			return nil, nil
 		}
-		return testResponse(request, http.StatusOK, `{"name":"Tvheadend"}`, nil), nil
 	})
 	_, handler, _ := testServer(t, transport)
 	response := httptest.NewRecorder()
@@ -378,6 +399,9 @@ func TestStatsMatchesObservedUHFShape(t *testing.T) {
 	}
 	if !strings.Contains(body, `"recordings_dir_stats":{"path":"/recordings"`) {
 		t.Fatalf("stats did not emulate the UHF recordings path: %s", body)
+	}
+	if !strings.Contains(body, `"total_bytes":491106508800,"used_bytes":319151938208,"free_bytes":171933995008`) {
+		t.Fatalf("stats did not use TVHeadend disk values: %s", body)
 	}
 	if strings.Index(body, `"version"`) > strings.Index(body, `"timestamp"`) || strings.Index(body, `"timestamp"`) > strings.Index(body, `"uptime_seconds"`) {
 		t.Fatalf("top-level fields do not follow the observed UHF order: %s", body)

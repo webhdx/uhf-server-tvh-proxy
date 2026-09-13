@@ -353,11 +353,21 @@ func (s *server) stats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	tvhDisk, err := s.tvh.diskStats(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
 	disk := diskStats("/")
 	var memory runtime.MemStats
 	runtime.ReadMemStats(&memory)
-	recordingsDisk := disk
-	recordingsDisk.Path = "/recordings"
+	recordingsDisk := diskStatsPayload{
+		Path:       "/recordings",
+		TotalBytes: tvhDisk.Total,
+		UsedBytes:  tvhDisk.Used,
+		FreeBytes:  tvhDisk.Free,
+	}
+	recordingsDisk.UsagePercent = float64(recordingsDisk.UsedBytes) / float64(recordingsDisk.TotalBytes) * 100
 	writeJSON(w, http.StatusOK, systemStats{
 		Version:       emulatedVersion,
 		Timestamp:     time.Now().UTC().Format("2006-01-02T15:04:05.000000"),

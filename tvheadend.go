@@ -89,6 +89,49 @@ func (c *tvhClient) ping(ctx context.Context) error {
 	return c.api(ctx, "serverinfo", nil, &result)
 }
 
+type tvhDiskStats struct {
+	Free  uint64
+	Used  uint64
+	Total uint64
+}
+
+func (c *tvhClient) diskStats(ctx context.Context) (tvhDiskStats, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("/comet/poll?immediate=1"), nil)
+	if err != nil {
+		return tvhDiskStats{}, err
+	}
+	c.authenticate(request)
+	response, err := c.client.Do(request)
+	if err != nil {
+		return tvhDiskStats{}, fmt.Errorf("TVHeadend disk stats request: %w", err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
+	if err != nil {
+		return tvhDiskStats{}, fmt.Errorf("read TVHeadend disk stats response: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return tvhDiskStats{}, fmt.Errorf("TVHeadend comet/poll returned %s: %s", response.Status, strings.TrimSpace(string(body)))
+	}
+	var result struct {
+		Messages []struct {
+			NotificationClass string `json:"notificationClass"`
+			Free              int64  `json:"freediskspace"`
+			Used              int64  `json:"useddiskspace"`
+			Total             int64  `json:"totaldiskspace"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return tvhDiskStats{}, fmt.Errorf("decode TVHeadend disk stats response: %w", err)
+	}
+	for _, message := range result.Messages {
+		if message.NotificationClass == "accessUpdate" && message.Free >= 0 && message.Used >= 0 && message.Total > 0 {
+			return tvhDiskStats{Free: uint64(message.Free), Used: uint64(message.Used), Total: uint64(message.Total)}, nil
+		}
+	}
+	return tvhDiskStats{}, fmt.Errorf("TVHeadend accessUpdate did not contain disk stats")
+}
+
 func (c *tvhClient) createRecording(ctx context.Context, request recordingCreate) (string, error) {
 	channel, err := channelFromRequest(request)
 	if err != nil {
